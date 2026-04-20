@@ -42,8 +42,6 @@ The current implementation focuses on **BTC daily market data** and builds a com
 - [Methodology](#methodology)
 - [Why This Project Matters](#why-this-project-matters)
 - [Roadmap](#roadmap)
-- [Star History](#star-history)
-- [Suggested Repository Enhancements](#suggested-repository-enhancements)
 - [Example Use Cases](#example-use-cases)
 - [Risk Disclaimer](#risk-disclaimer)
 - [License](#license)
