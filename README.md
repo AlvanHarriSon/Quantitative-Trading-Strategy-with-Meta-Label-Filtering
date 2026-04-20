@@ -31,7 +31,6 @@ The current implementation focuses on **BTC daily market data** and builds a com
 
 - [Overview](#overview)
 - [Results Preview](#results-preview)
-- [Strategy Pipeline](#strategy-pipeline)
 - [Key Features](#key-features)
 - [Strategy Logic](#strategy-logic)
 - [Project Structure](#project-structure)
