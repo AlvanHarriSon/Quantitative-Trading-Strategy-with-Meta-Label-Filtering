@@ -1,0 +1,3 @@
+-r requirements.txt
+notebook>=7.0
+jupyter>=1.0
