@@ -1,6 +1,3 @@
-import warnings
-warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -8,7 +5,6 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import yfinance as yf
 
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -22,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 class Config:
     ticker: str = "BTC-USD"
     start_date: str = "2018-01-01"
-    end_date: str = None
+    end_date: str | None = None
     interval: str = "1d"
 
     # primary strategy
@@ -57,7 +53,29 @@ class Config:
 
     # logistic regression
     logreg_C: float = 0.3
-    random_state: int = 42  
+    random_state: int = 42
+
+
+    def __post_init__(self):
+        for name in ("breakout_lookback", "max_holding_bars", "min_holding_bars",
+                     "exit_confirm_bars", "lookback_train_events", "retrain_every_events", "annualization"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.cooldown_bars, int) or self.cooldown_bars < 0:
+            raise ValueError("cooldown_bars must be a nonnegative integer")
+        if self.min_holding_bars > self.max_holding_bars:
+            raise ValueError("min_holding_bars exceeds max_holding_bars")
+        if not 0 < self.train_event_ratio < 1 or not 0 <= self.prob_threshold <= 1:
+            raise ValueError("Invalid train ratio or probability threshold")
+        if not 0 < self.max_drawdown_limit < 1:
+            raise ValueError("max_drawdown_limit must lie between zero and one")
+        for name in ("leverage", "trail_atr_mult", "logreg_C"):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not (0 <= self.fee_rate < 1 and 0 <= self.slippage_rate < 1
+                and self.fee_rate + self.slippage_rate < 1):
+            raise ValueError("Invalid transaction costs")
 
 
 CFG = Config()
@@ -74,6 +92,7 @@ def download_data(cfg: Config) -> pd.DataFrame:
         interval=cfg.interval,
         auto_adjust=True,
         progress=False,
+        timeout=30,
     )
 
     if df is None or df.empty:
@@ -92,7 +111,23 @@ def download_data(cfg: Config) -> pd.DataFrame:
     df = df[expected].copy()
     df = df.loc[:, ~df.columns.duplicated()]
     df.dropna(inplace=True)
-    return df
+    return validate_prices(df)
+
+
+def validate_prices(df):
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if df.empty or not set(required).issubset(df.columns):
+        raise ValueError("Nonempty OHLCV data is required")
+    if not df.index.is_unique or not df.index.is_monotonic_increasing:
+        raise ValueError("Price index must be unique and chronological")
+    values = df[required].to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("OHLCV values must be finite")
+    if (df[required[:4]] <= 0).any().any() or (df["Volume"] < 0).any():
+        raise ValueError("Prices must be positive and volume nonnegative")
+    if (df["High"] < df[["Open", "Close", "Low"]].max(axis=1)).any() or (df["Low"] > df[["Open", "Close", "High"]].min(axis=1)).any():
+        raise ValueError("Inconsistent OHLC range")
+    return df.copy()
 
 
 # =========================================================
@@ -108,6 +143,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     out = 100 - (100 / (1 + rs))
+    out = out.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
     return out.fillna(50)
 
 
@@ -137,8 +173,10 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = high.diff()
     minus_dm = -low.diff()
 
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    # Both masks must compare the original directional movements.
+    up, down = plus_dm, minus_dm
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
 
     prev_close = close.shift(1)
     tr1 = high - low
@@ -159,12 +197,12 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # Feature Engineering
 # =========================================================
 def build_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    out = df.copy()
+    out = validate_prices(df)
 
-    close = out["Close"].squeeze()
-    high = out["High"].squeeze()
-    low = out["Low"].squeeze()
-    volume = out["Volume"].squeeze()
+    close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
+    volume = out["Volume"]
 
     # trend
     out["ema_20"] = close.ewm(span=20, adjust=False).mean()
@@ -223,9 +261,11 @@ def build_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
     # 只取 setup 从 0 -> 1 的时点，避免连续多天重复触发
-    out["event"] = (long_setup & (~long_setup.shift(1).fillna(False))).astype(int)
+    out["event"] = (long_setup & (~long_setup.shift(1, fill_value=False))).astype(int)
 
     out = out.replace([np.inf, -np.inf], np.nan).dropna().copy()
+    if out.empty:
+        raise ValueError("Insufficient valid history after feature warmup")
     return out
 
 
@@ -252,15 +292,13 @@ def simulate_trade_from_pos(data: pd.DataFrame, pos: int, cfg: Config):
 
     last_pos = min(pos + cfg.max_holding_bars, len(data) - 1)
     exit_pos = last_pos
-    exit_reason = "TIME_EXIT"
+    exit_reason = "TIME_EXIT" if last_pos == pos + cfg.max_holding_bars else "END_OF_DATA"
 
     for j in range(pos + 1, last_pos + 1):
         close_j = float(data.loc[j, "Close"])
         low_j = float(data.loc[j, "Low"])
         atr_j = float(data.loc[j, "atr_14"])
         ema20_j = float(data.loc[j, "ema_20"])
-
-        trail_stop = max(trail_stop, close_j - cfg.trail_atr_mult * atr_j)
 
         # ATR trailing stop：随时可触发
         if low_j <= trail_stop:
@@ -279,8 +317,15 @@ def simulate_trade_from_pos(data: pd.DataFrame, pos: int, cfg: Config):
             exit_reason = "TREND_EXIT"
             break
 
+        # The close-based stop update becomes active on the next bar.
+        trail_stop = max(trail_stop, close_j - cfg.trail_atr_mult * atr_j)
+
     exit_price = float(data.loc[exit_pos, "Close"])
-    trade_return = exit_price / entry_price - 1.0 - 2 * cost
+    closes = data.loc[pos:exit_pos, "Close"].astype(float)
+    factors = 1 + closes.pct_change().iloc[1:] * cfg.leverage
+    if (factors <= 0).any():
+        raise ValueError("Leverage exhausted equity; liquidation is not modeled")
+    trade_return = float(factors.prod()) * (1 - cost) ** 2 - 1.0
     return trade_return, exit_pos, exit_reason
 
 
@@ -295,6 +340,8 @@ def build_event_dataset(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     for pos in event_positions:
         trade_ret, exit_pos, exit_reason = simulate_trade_from_pos(data, pos, cfg)
 
+        if exit_reason == "END_OF_DATA":
+            continue  # An unresolved event has no observable outcome yet.
         rec = {
             "date": data.loc[pos, "date"],
             "pos": pos,
@@ -320,7 +367,15 @@ def build_event_dataset(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # =========================================================
 # Walk-forward predict on EVENT DATASET
 # =========================================================
+def resolved_training_events(events, index, cfg):
+    candidates = events.iloc[:index]
+    eligible = candidates[candidates["exit_date"] < events.iloc[index]["date"]]
+    return eligible.tail(cfg.lookback_train_events).copy()
+
+
 def walk_forward_event_predict(events: pd.DataFrame, cfg: Config):
+    if not events["date"].is_monotonic_increasing or events["date"].duplicated().any():
+        raise ValueError("Events must be unique and chronological")
     if len(events) < 30:
         raise ValueError("事件数太少，连最基本的 walk-forward 都不够。")
 
@@ -334,8 +389,8 @@ def walk_forward_event_predict(events: pd.DataFrame, cfg: Config):
 
     for i in range(split_idx, len(events)):
         if (model is None) or ((i - split_idx) % cfg.retrain_every_events == 0):
-            train_start = max(0, i - cfg.lookback_train_events)
-            train_slice = events.iloc[train_start:i].copy()
+            # Earlier entries can still have future exits: purge unresolved labels.
+            train_slice = resolved_training_events(events, i, cfg)
 
             X_train = train_slice[FEATURE_COLS]
             y_train = train_slice["label"]
@@ -370,7 +425,7 @@ def walk_forward_event_predict(events: pd.DataFrame, cfg: Config):
     pred_events = pd.concat(pred_rows, axis=0).reset_index(drop=True)
 
     # 用测试起点前最后一个窗口训练一个最终模型，供输出系数
-    last_train = events.iloc[max(0, split_idx - cfg.lookback_train_events):split_idx].copy()
+    last_train = resolved_training_events(events, split_idx, cfg)
     last_model = None
     if last_train["label"].nunique() >= 2:
         last_model = Pipeline([
@@ -409,6 +464,8 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
 
     data = data[data["date"] >= test_start].copy().reset_index(drop=True)
 
+    if data.empty:
+        raise ValueError("No prices in the requested backtest period")
     equity = 1.0
     peak_equity = 1.0
     cooldown = 0
@@ -430,6 +487,8 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
     prev_close = np.nan
 
     for i in range(len(data)):
+        equity_before_bar = equity
+        in_cooldown = cooldown > 0
         row = data.loc[i]
         dt = row["date"]
         close = float(row["Close"])
@@ -440,6 +499,8 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
         # mark-to-market
         if i > 0 and position == 1:
             asset_ret = (close / prev_close - 1.0) * cfg.leverage
+            if asset_ret <= -1:
+                raise ValueError("Leverage exhausted equity; liquidation is not modeled")
             equity *= (1.0 + asset_ret)
             daily_ret_list.append(asset_ret)
         else:
@@ -466,13 +527,13 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
                 below_count = 0
 
             cooldown = cfg.cooldown_bars
+            in_cooldown = True
             peak_equity = equity
             drawdown = 0.0
 
         # manage open position
         if position == 1:
             hold_bars += 1
-            trail_stop = max(trail_stop, close - cfg.trail_atr_mult * atr_val)
 
             exit_reason = None
 
@@ -489,6 +550,9 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
                 elif hold_bars >= cfg.max_holding_bars:
                     exit_reason = "TIME_EXIT"
 
+            if exit_reason is None:
+                trail_stop = max(trail_stop, close - cfg.trail_atr_mult * atr_val)
+
             if exit_reason is not None:
                 equity *= (1.0 - cost)
                 trade_log.append({
@@ -504,12 +568,8 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
                 hold_bars = 0
                 below_count = 0
 
-        # cooldown
-        if cooldown > 0:
-            cooldown -= 1
-
         # entry
-        if position == 0 and cooldown == 0 and int(row["event"]) == 1:
+        if position == 0 and not in_cooldown and i < len(data) - 1 and int(row["event"]) == 1:
             allow_entry = True
 
             if use_meta:
@@ -525,8 +585,10 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
                 hold_bars = 0
                 below_count = 0
 
+                entry_equity = equity
                 equity *= (1.0 - cost)
                 trade_log.append({
+                    "equity_before_entry": entry_equity,
                     "date": dt,
                     "action": "ENTRY",
                     "price": close,
@@ -534,8 +596,16 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
                     "equity": equity
                 })
 
+        if i == len(data) - 1 and position == 1:
+            equity *= 1.0 - cost
+            trade_log.append({"date": dt, "action": "EXIT", "price": close,
+                              "reason": "END_OF_DATA", "equity": equity})
+            position = 0
+        if cooldown > 0:
+            cooldown -= 1
         equity_curve.append(equity)
-        daily_ret_list[-1] = daily_ret_list[-1] if len(daily_ret_list) > 0 else 0.0
+        # Include entry/exit costs in the same return stream used by Sharpe.
+        daily_ret_list[-1] = equity / equity_before_bar - 1.0
         pos_list.append(position)
         dd_list.append(drawdown)
         prev_close = close
@@ -544,7 +614,7 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
     result["strategy_equity"] = equity_curve
     result["strategy_daily_ret"] = daily_ret_list
     result["position"] = pos_list
-    result["drawdown"] = dd_list
+    result["drawdown"] = result["strategy_equity"] / result["strategy_equity"].cummax().clip(lower=1.0) - 1.0
     result["benchmark_equity"] = (1 + result["Close"].pct_change().fillna(0)).cumprod()
 
     trades = pd.DataFrame(trade_log)
@@ -555,7 +625,7 @@ def backtest_strategy(df: pd.DataFrame, cfg: Config, pred_events: pd.DataFrame =
 # Reports
 # =========================================================
 def compute_max_drawdown(equity_series: pd.Series) -> float:
-    peak = equity_series.cummax()
+    peak = equity_series.cummax().clip(lower=1.0)
     dd = equity_series / peak - 1.0
     return float(dd.min())
 
@@ -578,11 +648,17 @@ def pair_trades(trades: pd.DataFrame) -> pd.DataFrame:
         "exit_price": exits.loc[:n-1, "price"].values,
         "exit_reason": exits.loc[:n-1, "reason"].values,
     })
-    pairs["trade_return"] = pairs["exit_price"] / pairs["entry_price"] - 1.0
+    if "equity_before_entry" in entries and "equity" in exits:
+        pairs["trade_return"] = exits.loc[:n-1, "equity"].to_numpy() / entries.loc[:n-1, "equity_before_entry"].to_numpy() - 1.0
+    else:
+        # Compatibility for externally supplied legacy price-only trade logs.
+        pairs["trade_return"] = pairs["exit_price"] / pairs["entry_price"] - 1.0
     return pairs
 
 
 def performance_report(bt_df: pd.DataFrame, cfg: Config, trades: pd.DataFrame) -> dict:
+    if bt_df.empty:
+        raise ValueError("Cannot report an empty backtest")
     daily_ret = bt_df["strategy_daily_ret"].fillna(0.0)
 
     total_return = bt_df["strategy_equity"].iloc[-1] - 1.0
@@ -668,9 +744,9 @@ def print_report_block(title: str, report: dict):
 # =========================================================
 def plot_all(primary_bt: pd.DataFrame, meta_bt: pd.DataFrame):
     plt.figure(figsize=(13, 6))
-    plt.plot(primary_bt.index, primary_bt["benchmark_equity"], label="Benchmark Equity")
-    plt.plot(primary_bt.index, primary_bt["strategy_equity"], label="Primary Equity")
-    plt.plot(meta_bt.index, meta_bt["strategy_equity"], label="Meta-Filtered Equity")
+    plt.plot(primary_bt["date"], primary_bt["benchmark_equity"], label="Benchmark Equity")
+    plt.plot(primary_bt["date"], primary_bt["strategy_equity"], label="Primary Equity")
+    plt.plot(meta_bt["date"], meta_bt["strategy_equity"], label="Meta-Filtered Equity")
     plt.title("BTC-USD | Primary vs Meta-Filtered vs Benchmark")
     plt.xlabel("Date")
     plt.ylabel("Equity")
@@ -678,10 +754,11 @@ def plot_all(primary_bt: pd.DataFrame, meta_bt: pd.DataFrame):
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+    plt.close()
 
     plt.figure(figsize=(13, 4))
-    plt.plot(primary_bt.index, primary_bt["position"], label="Primary Position")
-    plt.plot(meta_bt.index, meta_bt["position"], label="Meta Position")
+    plt.plot(primary_bt["date"], primary_bt["position"], label="Primary Position")
+    plt.plot(meta_bt["date"], meta_bt["position"], label="Meta Position")
     plt.title("Position Over Time")
     plt.xlabel("Date")
     plt.ylabel("Position")
@@ -689,6 +766,7 @@ def plot_all(primary_bt: pd.DataFrame, meta_bt: pd.DataFrame):
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+    plt.close()
 
 
 # =========================================================
